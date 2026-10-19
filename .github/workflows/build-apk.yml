@@ -40,20 +40,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -d "$ANDROID_HOME/cmdline-tools" ]; then
-            echo "::error::Pasta de ferramentas Android não encontrada."
-            exit 1
-          fi
-
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print | sort -V | tail -n 1)"
 
           if [ -z "$SDKMANAGER" ]; then
             echo "::error::sdkmanager não encontrado."
             exit 1
           fi
-
-          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
 
@@ -64,6 +56,8 @@ jobs:
             'ndk;27.2.12479018' \
             'cmake;3.22.1'
 
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
       - name: Extrair projeto
         id: projeto
         shell: bash
@@ -72,15 +66,97 @@ jobs:
 
           ZIP="SF2Player_v0.9.5_ESTAVEL_AUDIO_PERSISTENTE.zip"
 
-          if [ ! -f "$ZIP" ]; then
+          if [ ! -f "$GITHUB_WORKSPACE/$ZIP" ]; then
             echo "::error::ZIP não encontrado: $ZIP"
+            echo "Arquivos disponíveis na raiz:"
+            ls -la "$GITHUB_WORKSPACE"
             exit 1
           fi
 
-          mkdir -p extraido
-          unzip -oq "$ZIP" -d extraido
+          mkdir -p "$GITHUB_WORKSPACE/extraido"
+          unzip -oq "$GITHUB_WORKSPACE/$ZIP" -d "$GITHUB_WORKSPACE/extraido"
 
           ROOT="$(find "$GITHUB_WORKSPACE/extraido" -type f -name settings.gradle.kts -print -quit | xargs -r dirname)"
 
           if [ -z "$ROOT" ] || [ ! -f "$ROOT/app/build.gradle.kts" ]; then
-            echo "::error::Estrutura do projeto Android
+            echo "::error::Não encontrei settings.gradle.kts e app/build.gradle.kts na estrutura extraída."
+            echo "Arquivos encontrados:"
+            find "$GITHUB_WORKSPACE/extraido" -maxdepth 6 -type f | head -200
+            exit 1
+          fi
+
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Projeto encontrado em: $ROOT"
+
+      - name: Preparar FluidSynth ARM64
+        working-directory: ${{ steps.projeto.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          SOURCE="$RUNNER_TEMP/fluidsynth-src"
+          BUILD="$RUNNER_TEMP/fluidsynth-build"
+
+          git clone --depth 1 --branch v2.4.6 \
+            https://github.com/FluidSynth/fluidsynth.git "$SOURCE"
+
+          cmake -S "$SOURCE" -B "$BUILD" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -Denable-libsndfile=OFF \
+            -Denable-pulseaudio=OFF \
+            -Denable-alsa=OFF \
+            -Denable-jack=OFF \
+            -Denable-oss=OFF \
+            -Denable-portaudio=OFF \
+            -Denable-readline=OFF \
+            -Denable-dbus=OFF \
+            -Denable-network=OFF \
+            -Denable-aufile=OFF
+
+          cmake --build "$BUILD" --config Release --parallel 2
+
+          LIB="$(find "$BUILD" -type f -name libfluidsynth.so -print -quit)"
+
+          if [ -z "$LIB" ]; then
+            echo "::error::A biblioteca libfluidsynth.so não foi gerada."
+            exit 1
+          fi
+
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          mkdir -p app/src/main/cpp/fluidsynth/include
+
+          cp "$LIB" app/src/main/jniLibs/arm64-v8a/
+          cp -R "$SOURCE/include/fluidsynth/." \
+            app/src/main/cpp/fluidsynth/include/
+
+      - name: Compilar APK
+        working-directory: ${{ steps.projeto.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gradle --no-daemon --stacktrace clean assembleDebug
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::O APK não foi gerado."
+            find app/build/outputs -type f -print || true
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      - name: Disponibilizar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SF2Player-APK-ARM64
+          path: ${{ steps.projeto.outputs.root }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
