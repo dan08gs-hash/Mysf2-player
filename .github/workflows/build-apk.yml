@@ -1,0 +1,146 @@
+
+name: Compilar SF2 Player
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'SF2Player_v0.9.5_ESTAVEL_AUDIO_PERSISTENTE.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Gerar APK Android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar ferramentas Android
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;27.2.12479018' \
+            'cmake;3.22.1'
+
+      - name: Extrair projeto
+        id: projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="SF2Player_v0.9.5_ESTAVEL_AUDIO_PERSISTENTE.zip"
+
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::ZIP não encontrado: $ZIP"
+            find . -maxdepth 2 -type f
+            exit 1
+          fi
+
+          mkdir -p extraido
+          unzip -oq "$ZIP" -d extraido
+
+          ROOT="$(find "$GITHUB_WORKSPACE/extraido" \
+            -type f -name settings.gradle.kts \
+            -print -quit | xargs -r dirname)"
+
+          if [ -z "$ROOT" ] || [ ! -f "$ROOT/app/build.gradle.kts" ]; then
+            echo "::error::Estrutura do projeto Android não encontrada."
+            find extraido -maxdepth 6 -type f
+            exit 1
+          fi
+
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Projeto encontrado em: $ROOT"
+
+      - name: Preparar FluidSynth ARM64
+        working-directory: ${{ steps.projeto.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+
+          git clone --depth 1 --branch v2.4.6 \
+            https://github.com/FluidSynth/fluidsynth.git \
+            "$RUNNER_TEMP/fluidsynth-src"
+
+          cmake -S "$RUNNER_TEMP/fluidsynth-src" \
+            -B "$RUNNER_TEMP/fluidsynth-build" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -Denable-libsndfile=OFF \
+            -Denable-pulseaudio=OFF \
+            -Denable-alsa=OFF \
+            -Denable-jack=OFF \
+            -Denable-oss=OFF \
+            -Denable-portaudio=OFF \
+            -Denable-readline=OFF \
+            -Denable-dbus=OFF \
+            -Denable-network=OFF \
+            -Denable-aufile=OFF
+
+          cmake --build "$RUNNER_TEMP/fluidsynth-build" \
+            --config Release --parallel 2
+
+          LIB="$(find "$RUNNER_TEMP/fluidsynth-build" \
+            -type f -name libfluidsynth.so -print -quit)"
+
+          if [ -z "$LIB" ]; then
+            echo "::error::A biblioteca FluidSynth não foi gerada."
+            exit 1
+          fi
+
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          mkdir -p app/src/main/cpp/fluidsynth/include
+
+          cp "$LIB" app/src/main/jniLibs/arm64-v8a/
+          cp -R "$RUNNER_TEMP/fluidsynth-src/include/fluidsynth/." \
+            app/src/main/cpp/fluidsynth/include/
+
+      - name: Compilar APK
+        working-directory: ${{ steps.projeto.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace clean assembleDebug
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::O APK não foi gerado."
+            find app/build/outputs -type f -print || true
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      - name: Disponibilizar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SF2Player-APK-ARM64
+          path: ${{ steps.projeto.outputs.root }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
